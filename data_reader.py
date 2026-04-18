@@ -1,17 +1,18 @@
 import glob
 import pandas as pd
 import plotly.graph_objects as go
-from black_scholes import BlackScholes, implied_volatility
+from plotly.subplots import make_subplots
+from black_scholes import implied_volatility
 import numpy as np
 
-# 🔹 Load ALL time snapshots
+# 🔹 Load data
 base_path = "data/2026-01-02/*/options.parquet"
 files = sorted(glob.glob(base_path))
 
 all_data = []
-spot_map = {}  # store spot per timestamp
+spot_series = []
 
-r = 0.06  # risk-free rate
+r = 0.06
 
 for file in files:
     timestamp_str = file.split("/")[-2]
@@ -21,39 +22,23 @@ for file in files:
     spot = pd.read_parquet(file.replace("options.parquet", "spot.parquet"))
     spot_price = spot[spot['instrument'] == 'cash'].close.iloc[0]
 
-    spot_map[timestamp] = spot_price
+    spot_series.append((timestamp, spot_price))
 
-    options = options[['expiry', 'strike', 'call_close', 'put_close',
-                       'call_open_interest', 'put_open_interest']].dropna()
+    options = options[['expiry', 'strike', 'call_close', 'put_close']].dropna()
 
     ivs = []
-
     for _, row in options.iterrows():
-        time_to_expiry = ((row.expiry - timestamp).total_seconds() / (24 * 3600)) / 365
+        T = ((row.expiry - timestamp).total_seconds() / (24 * 3600)) / 365
 
-        if time_to_expiry <= 0:
+        if T <= 0:
             ivs.append(np.nan)
             continue
 
         try:
             if row.strike > spot_price:
-                iv = implied_volatility(
-                    row.call_close,
-                    spot_price,
-                    row.strike,
-                    time_to_expiry,
-                    r,
-                    'call'
-                ) * 100
+                iv = implied_volatility(row.call_close, spot_price, row.strike, T, r, 'call') * 100
             else:
-                iv = implied_volatility(
-                    row.put_close,
-                    spot_price,
-                    row.strike,
-                    time_to_expiry,
-                    r,
-                    'put'
-                ) * 100
+                iv = implied_volatility(row.put_close, spot_price, row.strike, T, r, 'put') * 100
         except:
             iv = np.nan
 
@@ -64,107 +49,91 @@ for file in files:
 
     all_data.append(options)
 
-# 🔹 Combine all timestamps
 options_all = pd.concat(all_data)
+spot_df = pd.DataFrame(spot_series, columns=["timestamp", "spot"])
 
-# 🔹 Get unique timestamps
 timestamps = sorted(options_all['timestamp'].unique())
 
+# 🔹 Create frames
 frames = []
 
 for ts in timestamps:
     df = options_all[options_all['timestamp'] == ts].copy()
-    spot_price = spot_map[ts]
-
     df["days_to_expiry"] = (df["expiry"] - ts).dt.days
 
-    pivot = df.pivot_table(
-        values="iv",
-        index="days_to_expiry",
-        columns="strike"
-    )
-
+    pivot = df.pivot_table(values="iv", index="days_to_expiry", columns="strike")
     pivot = pivot.interpolate(axis=1).interpolate(axis=0)
 
     X, Y = np.meshgrid(pivot.columns, pivot.index)
     Z = pivot.values
 
-    # 🔹 Find ATM strike
-    strikes = np.array(pivot.columns)
-    atm_strike = strikes[np.argmin(np.abs(strikes - spot_price))]
-
-    # 🔹 Create ATM line (vertical across expiries)
-    atm_x = [atm_strike] * len(pivot.index)
-    atm_y = pivot.index
-    atm_z = [np.nanmax(Z)] * len(pivot.index)  # lift above surface
+    # Spot data up to this time
+    spot_subset = spot_df[spot_df["timestamp"] <= ts]
 
     frames.append(
         go.Frame(
             data=[
-                go.Surface(x=X, y=Y, z=Z),
-                go.Scatter3d(
-                    x=atm_x,
-                    y=atm_y,
-                    z=atm_z,
-                    mode='lines',
-                    line=dict(color='red', width=6),
-                    name='ATM'
+                go.Surface(x=X, y=Y, z=Z),  # surface
+                go.Scatter(                  # spot line
+                    x=spot_subset["timestamp"],
+                    y=spot_subset["spot"],
+                    mode="lines",
+                    name="Spot Price"
                 )
             ],
             name=str(ts.time())
         )
     )
 
-# 🔹 Initial frame
+# 🔹 Initial data
 first_ts = timestamps[0]
-first_df = options_all[options_all['timestamp'] == first_ts].copy()
-spot_price = spot_map[first_ts]
+df = options_all[options_all['timestamp'] == first_ts].copy()
+df["days_to_expiry"] = (df["expiry"] - first_ts).dt.days
 
-first_df["days_to_expiry"] = (first_df["expiry"] - first_ts).dt.days
-
-pivot = first_df.pivot_table(
-    values="iv",
-    index="days_to_expiry",
-    columns="strike"
-)
-
+pivot = df.pivot_table(values="iv", index="days_to_expiry", columns="strike")
 pivot = pivot.interpolate(axis=1).interpolate(axis=0)
 
 X, Y = np.meshgrid(pivot.columns, pivot.index)
 Z = pivot.values
 
-# ATM for first frame
-strikes = np.array(pivot.columns)
-atm_strike = strikes[np.argmin(np.abs(strikes - spot_price))]
-
-atm_x = [atm_strike] * len(pivot.index)
-atm_y = pivot.index
-atm_z = [np.nanmax(Z)] * len(pivot.index)
-
-# 🔹 Create figure
-fig = go.Figure(
-    data=[
-        go.Surface(x=X, y=Y, z=Z),
-        go.Scatter3d(
-            x=atm_x,
-            y=atm_y,
-            z=atm_z,
-            mode='lines',
-            line=dict(color='red', width=6),
-            name='ATM'
-        )
-    ],
-    frames=frames
+# 🔹 Create subplots
+fig = make_subplots(
+    rows=1, cols=2,
+    specs=[[{"type": "surface"}, {"type": "xy"}]],
+    column_widths=[0.7, 0.3],
+    subplot_titles=("IV Surface", "Spot Price")
 )
 
-# 🔹 Slider + controls
+# Initial traces
+fig.add_trace(go.Surface(x=X, y=Y, z=Z), row=1, col=1)
+
+fig.add_trace(
+    go.Scatter(
+        x=[first_ts],
+        y=[spot_df.iloc[0]["spot"]],
+        mode="lines",
+        name="Spot Price"
+    ),
+    row=1, col=2
+)
+
+# 🔹 Attach frames
+fig.frames = frames
+
+# 🔹 Layout
 fig.update_layout(
-    title="IV Surface (Time Evolution) with ATM Highlight",
+    title="IV Surface + Spot Price",
+
     scene=dict(
         xaxis_title="Strike",
         yaxis_title="Days to Expiry",
         zaxis_title="IV"
     ),
+
+    # 🔹 Correct way to set subplot axis titles
+    xaxis2=dict(title="Time"),
+    yaxis2=dict(title="Spot Price"),
+
     sliders=[{
         "steps": [
             {
@@ -182,7 +151,7 @@ fig.update_layout(
         "buttons": [
             {"label": "Play",
              "method": "animate",
-             "args": [None, {"frame": {"duration": 300, "redraw": True}}]},
+             "args": [None, {"frame": {"duration": 300}}]},
             {"label": "Pause",
              "method": "animate",
              "args": [[None], {"frame": {"duration": 0}}]}
